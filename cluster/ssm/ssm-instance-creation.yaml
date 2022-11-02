@@ -1,0 +1,233 @@
+description: action when instance launch
+schemaVersion: '0.3'
+assumeRole: '{{ automationAssumeRole }}'
+parameters:
+  MasterIPStore:
+    type: String
+    description: "the key of master ip on SSM"
+    default: '${MasterIPStore}'
+  MasterIP:
+    type: String
+    description: "the ip of master"
+    default: '{{ ssm:${MasterIPStore} }}'
+  JoinTokenStore:
+    type: String
+    description: "the key of master token"
+    default: '${JoinTokenStore}'
+  JoinToken:
+    type: String
+    description: "the token of master"
+    default: '{{ ssm:${JoinTokenStore} }}'
+  automationAssumeRole:
+    type: String
+    default: '${automationAssumeRole}'
+  CloudWatchLogGroupName:
+    type: String
+    default: '${CloudWatchLogGroupName}'
+  ASGName:
+    type: String
+    default: '${ASGName}'
+  InstanceId:
+    type: String
+  LifecycleHookName:
+    type: String
+  AutoScalingGroupName:
+    type: String
+
+mainSteps:
+  # step req
+  - name: waitUntilInstanceStateRunning
+    action: aws:waitForAwsResourceProperty
+    timeoutSeconds: 100
+    inputs:
+      Service: ec2
+      Api: DescribeInstanceStatus
+      InstanceIds:
+        - '{{ InstanceId }}'
+      PropertySelector: '$.InstanceStatuses[0].InstanceState.Name'
+      DesiredValues:
+        - running
+    nextStep: WaitForSSMAgentRegistration
+  - name: WaitForSSMAgentRegistration
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 100
+    maxAttempts: 60
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      InstanceInformationFilterList:
+        - key: InstanceIds
+          valueSet:
+            - '{{ InstanceId }}'
+      PropertySelector: '$.InstanceInformationList[0].PingStatus'
+      DesiredValues:
+        - Online
+    nextStep: InstallDocker
+  - name: InstallDocker
+    action: 'aws:runCommand'
+    timeoutSeconds: 900
+    maxAttempts: 2
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: true
+        CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
+      Parameters:
+        workingDirectory: /tmp/
+        commands:
+          - |
+            echo InstallDocker
+            sudo yum update -y
+            sudo amazon-linux-extras install docker
+            sudo service docker start
+            sudo usermod -a -G docker ec2-user
+            sudo yum install python3-pip -y
+            sudo pip3 install docker-compose
+            sudo systemctl enable docker.service
+            sudo systemctl start docker.service
+            sudo systemctl status docker.service
+    nextStep: GetCapacityASG
+  - name: GetCapacityASG
+    action: aws:executeAwsApi
+    timeoutSeconds: 15
+    onFailure: Abort
+    maxAttempts: 2
+    inputs:
+      Service: autoscaling
+      Api: DescribeAutoScalingGroups
+      AutoScalingGroupNames:
+        - '{{ ASGName }}'
+      MaxRecords: 1
+    outputs:
+      - Name: CapacityASG
+        Selector: '$.AutoScalingGroups[0].DesiredCapacity'
+        Type: Integer
+    nextStep: IfMasterOrWorker
+  # Conditions to become a master
+  - name: IfMasterOrWorker
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: GetPrivateIp
+          Variable: '{{ GetCapacityASG.CapacityASG }}'
+          NumericEquals: 1
+        - NextStep: SwarmJoin
+          Variable: '{{ GetCapacityASG.CapacityASG }}'
+          NumericGreaterOrEquals: 2
+  # Get ip
+  - name: GetPrivateIp
+    action: aws:executeAwsApi
+    timeoutSeconds: 15
+    onFailure: Abort
+    maxAttempts: 2
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      Filters:
+        - Key: InstanceIds
+          Values:
+            - '{{ InstanceId }}'
+    outputs:
+      - Name: PrivateIpMaster
+        Selector: '$.InstanceInformationList[0].IPAddress'
+        Type: String
+    nextStep: UpdateIPMaster
+  - name: UpdateIPMaster
+    action: 'aws:executeAwsApi'
+    timeoutSeconds: 15
+    onFailure: Abort
+    maxAttempts: 2
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '{{ MasterIPStore }}'
+      Overwrite: true
+      Type: String
+      Value: '{{ GetPrivateIp.PrivateIpMaster }}'
+    nextStep: SwarmInit
+  # SwarmInit (if node is master)
+  - name: SwarmInit
+    action: 'aws:runCommand'
+    timeoutSeconds: 900
+    maxAttempts: 2
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: true
+        CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
+      Parameters:
+        workingDirectory: /tmp/
+        commands:
+          - |
+            echo SwarmIni
+            docker swarm init --advertise-addr {{ GetPrivateIp.PrivateIpMaster }}
+            JOIN_TOKEN=$(docker swarm join-token -q worker)
+            aws ssm put-parameter --name {{ JoinTokenStore }} --type String --value $JOIN_TOKEN --overwrite --region {{ global:REGION }}
+    isCritical: true
+    nextStep: createTagsForMaster
+  - name: createTagsForMaster
+    action: aws:createTags
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      ResourceType: EC2
+      ResourceIds:
+        - '{{ InstanceId }}'
+      Tags:
+      - Key: Node
+        Value: Master
+    nextStep: SendHookSignal
+
+  # SwarmJoin (if node is worker)
+  - name: SwarmJoin
+    action: 'aws:runCommand'
+    timeoutSeconds: 900
+    maxAttempts: 2
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: true
+        CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
+      Parameters:
+        workingDirectory: /tmp/
+        commands:
+          - |
+            echo SwarmJoin
+            COMMAND="docker swarm join --token {{ JoinToken }} {{ MasterIP }}:2377"
+            if $COMMAND ; then
+                echo "SwarmInit succeeded"
+            else
+                docker swarm leave --force; $COMMAND
+            fi
+    isCritical: true
+    nextStep: createTagsForWorker
+  - name: createTagsForWorker
+    action: aws:createTags
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      ResourceType: EC2
+      ResourceIds:
+        - '{{ InstanceId }}'
+      Tags:
+      - Key: Node
+        Value: Worker
+    nextStep: SendHookSignal
+
+  # End step
+  - name: SendHookSignal
+    action: 'aws:executeAwsApi'
+    inputs:
+      LifecycleHookName: '{{LifecycleHookName}}'
+      InstanceId: '{{InstanceId}}'
+      AutoScalingGroupName: '{{AutoScalingGroupName}}'
+      Service: autoscaling
+      Api: CompleteLifecycleAction
+      LifecycleActionResult: CONTINUE
+    isEnd: true

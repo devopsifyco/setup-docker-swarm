@@ -1,0 +1,65 @@
+description: action when instance terminate
+schemaVersion: '0.3'
+assumeRole: '{{ automationAssumeRole }}'
+parameters:
+  automationAssumeRole:
+    type: String
+    default: "${automationAssumeRole}"
+  CloudWatchLogGroupName:
+    type: String
+    default: "${CloudWatchLogGroupName}"
+  TimeExecute:
+    type: String
+  InstanceId:
+    type: String
+  LifecycleHookName:
+    type: String
+  AutoScalingGroupName:
+    type: String
+
+mainSteps:
+  - name: WriteLogs
+    action: 'aws:runCommand'
+    timeoutSeconds: 600
+    onFailure: Abort
+    maxAttempts: 2
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: true
+        CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
+      Parameters:
+        workingDirectory: /tmp
+        commands: >
+          echo "Terminating instance {{ InstanceId }} by {{ LifecycleHookName }}
+          of {{ AutoScalingGroupName }} at {{ global:DATE_TIME }}"
+
+  - name: SwarmLeave
+    action: 'aws:runCommand'
+    timeoutSeconds: 900
+    maxAttempts: 2
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: true
+        CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
+      Parameters:
+        workingDirectory: /tmp/
+        commands:
+          - |
+            echo SwarmLeave
+            docker swarm leave --force
+
+  - name: TerminateTheInstance
+    action: aws:executeAwsApi
+    inputs:
+      LifecycleHookName: '{{ LifecycleHookName }}'
+      InstanceId: '{{ InstanceId }}'
+      AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+      Service: autoscaling
+      Api: CompleteLifecycleAction
+      LifecycleActionResult: CONTINUE
